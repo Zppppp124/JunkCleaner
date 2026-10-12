@@ -1,0 +1,40 @@
+# ---- 构建环境与产物 ----
+.buildvenv/
+build/
+build_*/
+dist/
+dist_*/
+*.spec.bak
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ---- 运行时生成物 ----
+runtime/
+*.log
+status.json
+events.jsonl
+config.json
+last_scan.json
+trust.json
+
+# ---- 第三方专有安装包（不随源码分发）----
+# MSI Afterburner 是微星专有软件，许可不允许再分发。
+# 需要内嵌时由使用者自行下载后运行：python build_exe.py --bundle-ab
+junkcleaner/assets/MSIAfterburnerSetup.zip
+junkcleaner/assets/setup/
+
+# ---- 截图/临时文件 ----
+tools/_shot*.png
+tools/_def.png
+_tmp_*.png
+*.tmp
+
+# ---- 编辑器/系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
