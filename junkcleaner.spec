@@ -36,6 +36,7 @@ hiddenimports = [
     "junkcleaner.vfcurve", "junkcleaner.undervolt", "junkcleaner.gpu_load",
     "junkcleaner.fan", "junkcleaner.hwinfo", "junkcleaner.cpubench",
     "junkcleaner.gpu_live",
+    "junkcleaner.localgpo",
     "junkcleaner.memtest", "junkcleaner.ui_hardware",
     "junkcleaner.afterburner", "junkcleaner.silent_uninstall",
     "numpy",

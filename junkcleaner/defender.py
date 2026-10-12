@@ -21,10 +21,11 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Iterable
 
-from . import core
+from . import core, localgpo
 
 POLICY_ROOT = r"SOFTWARE\Policies\Microsoft\Windows Defender"
 SCAN_KEY = POLICY_ROOT + r"\Scan"
+QUARANTINE_KEY = POLICY_ROOT + r"\Quarantine"
 
 REG_SZ = winreg.REG_SZ
 REG_DWORD = winreg.REG_DWORD
@@ -77,7 +78,8 @@ BALANCED: list[Setting] = [
     Setting("计划快速扫描时间", "ScheduleQuickScanTime", "dword", 720,
             "把快速扫描安排在 12:00（通常不在游戏时段）", "low"),
     Setting("扫描历史记录保留天数", "PurgeItemsAfterDelay", "dword", 30,
-            "扫描记录 30 天后清理，减少历史积累", "none"),
+            "扫描记录 30 天后清理，减少历史积累", "none",
+            key=QUARANTINE_KEY),
 ]
 
 # --------------------------------------------------------------------------
@@ -136,7 +138,7 @@ MINIMAL_EXTRA: list[Setting] = [
     Setting("关闭错过扫描后的追赶扫描（完整）", "DisableCatchupFullScan",
             "dword", 1, "错过的完整扫描不补跑", "low"),
     Setting("扫描历史记录保留天数", "PurgeItemsAfterDelay", "dword", 7,
-            "历史记录 7 天后清理", "none"),
+            "历史记录 7 天后清理", "none", key=QUARANTINE_KEY),
 ]
 
 # 合并三个档位并按 value 去重（后出现的覆盖先出现的），
@@ -223,6 +225,8 @@ def backup() -> Path:
         "root_key_exists": key_exists(POLICY_ROOT),
         "values": read_current(),
         "raw_scan_values": _read_all(SCAN_KEY),
+        # 本地组策略文件内容（gpedit 显示状态的来源）
+        "local_gpo": localgpo.snapshot(),
     }
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     path = backup_dir() / f"defender_policy_{stamp}.json"
@@ -280,30 +284,44 @@ def is_admin() -> bool:
 
 
 def apply_preset(preset: str = "balanced") -> dict[str, Any]:
-    """应用预设。先备份，再逐项写入。"""
+    """应用预设。先备份，再逐项写入注册表，并同步写本地组策略文件。
+
+    为什么要写两份：
+      * 注册表（HKLM\\SOFTWARE\\Policies\\...）—— Defender 实际读取生效
+      * Registry.pol（本地组策略对象）—— gpedit.msc 显示的「已启用/未配置」
+    只写注册表的话功能会生效，但 gpedit 仍显示「未配置」。
+    """
     if not is_admin():
         return {"ok": False, "error": "需要管理员权限", "applied": 0, "backup": ""}
     settings = PRESETS.get(preset, BALANCED)
     backup_path = backup()
     applied = 0
     failed: list[str] = []
+    pol_items: list[tuple[str, str, int, bytes]] = []
     for s in settings:
         try:
             if s.kind == "dword":
                 _write_dword(s.key, s.value, int(s.target))
+                pol_items.append((s.key, s.value, localgpo.REG_DWORD,
+                                  localgpo.dword(int(s.target))))
             else:
                 with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, s.key, 0,
                                         winreg.KEY_SET_VALUE) as k:
                     winreg.SetValueEx(k, s.value, 0, REG_SZ, str(s.target))
+                pol_items.append((s.key, s.value, localgpo.REG_SZ,
+                                  str(s.target).encode("utf-16le") + b"\x00\x00"))
             applied += 1
         except Exception as exc:  # noqa: BLE001
             failed.append(f"{s.name}: {exc}")
+    # 同步写入本地组策略文件，这样 gpedit 也会显示为已配置
+    pol_result = localgpo.set_policies(pol_items, refresh=True)
     core.log(f"应用 Defender 策略[{preset}]：成功 {applied}，失败 {len(failed)}",
              source="defender")
     core.log_event("defender_policy", {"preset": preset, "applied": applied,
                                        "failed": failed, "backup": str(backup_path)})
     return {"ok": not failed, "applied": applied, "failed": failed,
-            "backup": str(backup_path), "total": len(settings)}
+            "backup": str(backup_path), "total": len(settings),
+            "pol": pol_result}
 
 
 def restore_backup(path: str | Path) -> dict[str, Any]:
@@ -339,17 +357,23 @@ def restore_backup(path: str | Path) -> dict[str, Any]:
 
 
 def restore_defaults() -> dict[str, Any]:
-    """删除本工具写入的全部策略值（回到「未配置」）。"""
+    """删除本工具写入的全部策略值（注册表 + 本地组策略，回到「未配置」）。"""
     if not is_admin():
         return {"ok": False, "error": "需要管理员权限"}
     removed = 0
-    for s in BALANCED + AGGRESSIVE_EXTRA:
+    pol_items: list[tuple[str, str]] = []
+    for s in PRESETS["off"]:
         exists, _ = _read_value(s.key, s.value)
         if exists:
             _delete_value(s.key, s.value)
             removed += 1
+        pol_items.append((s.key, s.value))
+    # 也清掉早期版本写错位置的残留（PurgeItemsAfterDelay 原来写到了 Scan 键）
+    _delete_value(SCAN_KEY, "PurgeItemsAfterDelay")
+    pol_items.append((SCAN_KEY, "PurgeItemsAfterDelay"))
+    pol_result = localgpo.remove_policies(pol_items, refresh=True)
     core.log(f"Defender 策略已恢复未配置：删除 {removed} 项", source="defender")
-    return {"ok": True, "removed": removed}
+    return {"ok": True, "removed": removed, "pol": pol_result}
 
 
 # --------------------------------------------------------------------------
@@ -383,7 +407,35 @@ def tamper_protected() -> bool:
 
 def notify_policy_change() -> None:
     """通知系统策略已更新（可选，加速生效）。"""
-    try:
-        core.run(["gpupdate", "/force", "/target:computer"], timeout=180)
-    except Exception:  # noqa: BLE001
-        pass
+    localgpo.refresh_policy()
+
+
+def policy_status() -> dict[str, Any]:
+    """汇总「注册表是否生效」与「gpedit 是否显示为已配置」。
+
+    两者可能不一致：
+      * 只在注册表有值 → 功能生效，但 gpedit 显示「未配置」
+      * 只在 Registry.pol 有值 → gpedit 显示「已启用」，刷新后下发到注册表
+    本工具现在会同时写入两处，保持一致。
+    """
+    settings = PRESETS.get("off", [])
+    rows = []
+    for s in settings:
+        exists, value = _read_value(s.key, s.value)
+        rows.append({
+            "name": s.name,
+            "value": s.value,
+            "key": s.key,
+            "in_registry": exists,
+            "registry_value": value,
+            "target": s.target,
+            "in_policy_file": localgpo.policy_present(s.key, s.value),
+            "effective": exists and value == s.target,
+        })
+    return {
+        "rows": rows,
+        "total": len(rows),
+        "effective": sum(1 for r in rows if r["effective"]),
+        "in_policy_file": sum(1 for r in rows if r["in_policy_file"]),
+        "pol_path": str(localgpo.POL_MACHINE),
+    }

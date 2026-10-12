@@ -38,3 +38,6 @@ _tmp_*.png
 .idea/
 Thumbs.db
 desktop.ini
+
+# ---- 内嵌第三方安装包的构建产物（不提交）----
+dist_with_afterburner.exe
