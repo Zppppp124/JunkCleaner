@@ -66,7 +66,8 @@ class UndervoltWorker(QThread):
     done = Signal(dict)
 
     def __init__(self, freq: int, seconds: int, step: float, floor: float,
-                 max_steps: int = 0, section: str = "Profile1") -> None:
+                 max_steps: int = 0, section: str = "Profile1",
+                 margin: float = 25.0, transient: bool = True) -> None:
         super().__init__()
         self.freq = freq
         self.seconds = seconds
@@ -74,6 +75,8 @@ class UndervoltWorker(QThread):
         self.floor = floor
         self.max_steps = max_steps
         self.section = section
+        self.margin = margin
+        self.transient = transient
         self.engine: undervolt.AdaptiveUndervolt | None = None
 
     def run(self) -> None:
@@ -81,6 +84,8 @@ class UndervoltWorker(QThread):
             freq=self.freq, test_seconds=self.seconds, step_mv=self.step,
             floor_mv=self.floor, max_steps=self.max_steps,
             section=self.section,
+            margin_mv=self.margin,
+            transient=self.transient,
             progress=lambda m: self.progress.emit(m))
         self.done.emit(self.engine.run().to_dict())
 
@@ -180,8 +185,18 @@ class TuningPage(QWidget):
         self.spin_watts.setSuffix(" W")
         self.spin_stress = QSpinBox()
         self.spin_stress.setRange(10, 600)
-        self.spin_stress.setValue(60)
+        # 默认 300 秒：稳态满载要跑得足够久，才能暴露供电瞬态不足。
+        # 单档太短（如 60 秒）会把临界不稳定的电压误判为「稳定」。
+        self.spin_stress.setValue(300)
         self.spin_stress.setSuffix(" 秒")
+        self.spin_stress.setToolTip(
+            "单档满载验证时长。建议 ≥300 秒；时间越短越容易把临界电压误判为稳定。")
+        # 瞬态负载：在满载与轻载间反复跳变，制造电流突变，更接近游戏工况。
+        self.check_transient = QCheckBox("瞬态负载模式")
+        self.check_transient.setChecked(True)
+        self.check_transient.setToolTip(
+            "在满载与轻载间反复跳变，制造电流突变（dv/dt）。\n"
+            "游戏花屏多由这种瞬态压降引起，恒定满载测不出来。")
         self.btn_lock = QPushButton("锁定频率")
         self.btn_lock.setObjectName("Primary")
         self.btn_lock.clicked.connect(self.lock_gpu)
@@ -212,11 +227,12 @@ class TuningPage(QWidget):
         gg.addWidget(self.spin_watts, 1, 3)
         gg.addWidget(QLabel("验证时长"), 2, 0)
         gg.addWidget(self.spin_stress, 2, 1)
-        gg.addWidget(self.btn_lock, 2, 2, 1, 2)
-        gg.addWidget(self.btn_power_limit, 3, 0, 1, 2)
-        gg.addWidget(self.btn_stress, 3, 2, 1, 2)
-        gg.addWidget(self.btn_reset_gpu, 4, 0, 1, 2)
-        gg.addWidget(self.btn_gpu_persist, 4, 2, 1, 2)
+        gg.addWidget(self.check_transient, 2, 2, 1, 2)
+        gg.addWidget(self.btn_lock, 3, 0, 1, 4)
+        gg.addWidget(self.btn_power_limit, 4, 0, 1, 2)
+        gg.addWidget(self.btn_stress, 4, 2, 1, 2)
+        gg.addWidget(self.btn_reset_gpu, 5, 0, 1, 2)
+        gg.addWidget(self.btn_gpu_persist, 5, 2, 1, 2)
 
         # ---- 降压调优（走 Afterburner V/F 曲线）----
         ab = vfcurve.afterburner_dir()
@@ -226,12 +242,12 @@ class TuningPage(QWidget):
         self.lbl_ab.setWordWrap(True)
         self.lbl_ab.setStyleSheet(
             f"color:{GOOD if ab else WARN};font-weight:600;")
-        gg.addWidget(self.lbl_ab, 5, 0, 1, 4)
+        gg.addWidget(self.lbl_ab, 6, 0, 1, 4)
 
         self.lbl_curve = QLabel("—")
         self.lbl_curve.setWordWrap(True)
         self.lbl_curve.setTextFormat(Qt.RichText)
-        gg.addWidget(self.lbl_curve, 6, 0, 1, 4)
+        gg.addWidget(self.lbl_curve, 7, 0, 1, 4)
 
         self.spin_step = QSpinBox()
         self.spin_step.setRange(5, 100)
@@ -243,15 +259,15 @@ class TuningPage(QWidget):
         self.spin_floor.setSingleStep(25)
         self.spin_floor.setValue(800)
         self.spin_floor.setSuffix(" mV")
-        gg.addWidget(QLabel("每档降压"), 7, 0)
-        gg.addWidget(self.spin_step, 7, 1)
-        gg.addWidget(QLabel("电压下限"), 7, 2)
-        gg.addWidget(self.spin_floor, 7, 3)
+        gg.addWidget(QLabel("每档降压"), 8, 0)
+        gg.addWidget(self.spin_step, 8, 1)
+        gg.addWidget(QLabel("电压下限"), 8, 2)
+        gg.addWidget(self.spin_floor, 8, 3)
 
         self.cmb_slot = QComboBox()
         self.cmb_slot.setToolTip("搜索完成后把锁定曲线写入这个 Afterburner 预设槽位")
-        gg.addWidget(QLabel("保存到预设"), 8, 0)
-        gg.addWidget(self.cmb_slot, 8, 1, 1, 3)
+        gg.addWidget(QLabel("保存到预设"), 9, 0)
+        gg.addWidget(self.cmb_slot, 9, 1, 1, 3)
 
         self.btn_uv_search = QPushButton("自动搜索最低稳定电压")
         self.btn_uv_search.setObjectName("Primary")
@@ -269,10 +285,10 @@ class TuningPage(QWidget):
             "把最近一次搜索的稳定结果写入所选预设，并设为 Afterburner 启动预设")
         self.btn_uv_apply.setEnabled(False)
         self.btn_uv_apply.clicked.connect(self.apply_undervolt_preset)
-        gg.addWidget(self.btn_uv_search, 9, 0, 1, 2)
-        gg.addWidget(self.btn_uv_cancel, 9, 2)
-        gg.addWidget(self.btn_uv_restore, 9, 3)
-        gg.addWidget(self.btn_uv_apply, 10, 0, 1, 4)
+        gg.addWidget(self.btn_uv_search, 10, 0, 1, 2)
+        gg.addWidget(self.btn_uv_cancel, 10, 2)
+        gg.addWidget(self.btn_uv_restore, 10, 3)
+        gg.addWidget(self.btn_uv_apply, 11, 0, 1, 4)
         top.addWidget(gw)
         lay.addLayout(top)
 
@@ -602,6 +618,8 @@ class TuningPage(QWidget):
                 "或先在 Afterburner 里刷新一次曲线。")
             return
         est = max(1, int((orig - floor) / step))
+        margin = max(0.0, float(self.spin_step.value()))
+        transient = bool(self.check_transient.isChecked())
         msg = (
             f"目标频率：{freq} MHz\n"
             f"当前电压：{orig:.0f} mV\n"
@@ -609,10 +627,14 @@ class TuningPage(QWidget):
             f"计划保存到：{section}（搜索完成后可一键应用并固化）\n"
             f"每档降压：-{step:.0f} mV，下限 {floor:.0f} mV\n"
             f"单档满载验证：{secs} 秒\n"
+            f"负载模式：{'瞬态（满载↔轻载跳变）' if transient else '恒定满载'}\n"
+            f"稳定后余量：+{margin:.0f} mV（建议电压会自动加这一档）\n"
             f"预计最多 {est} 档（约 {est * (secs + 8) // 60} 分钟）\n\n"
             "流程：每档会短暂关闭 Afterburner（避免它用内存里的旧预设\n"
             "覆盖我们写入的曲线）→ 写入曲线并归零核心频率偏移 → 重启\n"
-            "Afterburner 加载 → PyTorch 满载压测 → 稳定就继续降。\n"
+            "Afterburner 加载 → PyTorch 满载压测 + 数值校验 → 稳定就继续降。\n"
+            "注意：压测是稳态负载，游戏是瞬态负载，所以搜索出的最低稳定\n"
+            "电压会再留一档余量作为建议值，避免游戏里花屏。\n"
             "搜索期间屏幕可能闪一下、Afterburner 托盘图标短暂消失，属正常。\n"
             "全程会先备份曲线；若中途出问题会自动还原，不会留下不稳定配置。\n\n"
             "开始后请勿运行其他大型 3D 程序。是否继续？")
@@ -622,7 +644,8 @@ class TuningPage(QWidget):
         self.btn_uv_cancel.setEnabled(True)
         self.btn_uv_apply.setEnabled(False)
         self.progress.setValue(0)
-        self._uv = UndervoltWorker(freq, secs, step, floor, section=section)
+        self._uv = UndervoltWorker(freq, secs, step, floor, section=section,
+                                   margin=margin, transient=transient)
         self._uv.progress.connect(
             lambda m: self.progress.setFormat(m[:110]))
         self._uv.done.connect(self._on_undervolt)
@@ -642,6 +665,9 @@ class TuningPage(QWidget):
         rows = [("目标频率", f"{r.get('target_freq')} MHz"),
                 ("原始电压", f"{r.get('original_mv'):.0f} mV"),
                 ("最低稳定电压", f"{r.get('lowest_stable_mv'):.0f} mV"),
+                ("建议电压（含余量）",
+                 f"{r.get('suggested_mv', 0):.0f} mV"
+                 f"（+{r.get('margin_mv', 0):.0f} mV）"),
                 ("降压幅度", f"{r.get('original_mv', 0) - r.get('best_mv', 0):.0f} mV"),
                 ("保存预设", str(r.get("section") or "—")),
                 ("启动预设", f"Profile{r.get('startup_profile')}"
@@ -670,16 +696,19 @@ class TuningPage(QWidget):
         if r.get("ok") and r.get("attempts"):
             QMessageBox.information(
                 self, "降压完成",
-                f"最低稳定电压：{r.get('lowest_stable_mv'):.0f} mV\n"
+                f"最低稳定电压（压测结果）：{r.get('lowest_stable_mv'):.0f} mV\n"
+                f"建议使用电压：{r.get('suggested_mv', 0):.0f} mV"
+                f"（已加 {r.get('margin_mv', 0):.0f} mV 安全余量）\n"
                 f"（原始 {r.get('original_mv'):.0f} mV，"
                 f"降低 {r.get('original_mv', 0) - r.get('best_mv', 0):.0f} mV）\n\n"
-                "搜索结果已验证。点「一键应用并固化」把它写入 Afterburner "
-                "预设，并设为开机自动应用。")
+                "说明：压测是稳态满载，游戏是瞬态负载，同电压下游戏可能\n"
+                "更容易花屏。所以默认加一档余量，一键应用时会使用「建议\n"
+                "使用电压」。写完预设后请用真实游戏再验证一段时间。")
             self.btn_uv_apply.setEnabled(True)
         if self.notify:
             self.notify("GPU 降压完成",
                         f"{r.get('target_freq')}MHz @ "
-                        f"{r.get('lowest_stable_mv'):.0f}mV")
+                        f"{r.get('suggested_mv', r.get('lowest_stable_mv', 0)):.0f}mV")
         self.refresh()
 
     def apply_undervolt_preset(self) -> None:
@@ -696,12 +725,19 @@ class TuningPage(QWidget):
             return
         section = self.cmb_slot.currentText() or "Profile1"
         freq = int(r.get("target_freq") or self.spin_clock.value())
-        mv = float(r.get("lowest_stable_mv") or 0)
+        # 默认应用「建议电压」（最低稳定值 + 安全余量），而不是临界值。
+        # 稳态压测通过不等于游戏瞬态负载也稳。
+        low = float(r.get("lowest_stable_mv") or 0)
+        mv = float(r.get("suggested_mv") or 0) or low
         if mv <= 0:
             return
+        margin_note = (f"（最低稳定 {low:.0f} mV，"
+                       f"加 {mv - low:.0f} mV 余量）"
+                       if mv > low else "")
         if QMessageBox.question(
                 self, "一键应用并固化",
                 f"把 {freq} MHz @ {mv:.0f} mV 写入 [{section}]，\n"
+                f"{margin_note}\n"
                 "并设为 Afterburner 启动预设（开机自动应用）？\n\n"
                 "会先备份当前 Profile。") != QMessageBox.Yes:
             return

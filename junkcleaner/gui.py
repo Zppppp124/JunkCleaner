@@ -335,6 +335,17 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(14, 12, 14, 12)
         root.setSpacing(10)
 
+        # 状态栏标签必须最先创建：各个页面在构造时就会通过回调调用
+        # self.status_label.setText()，如果等到最后才建，页面构造阶段
+        # 一旦触发 set_status 就会 AttributeError。
+        if not hasattr(self, "status_label"):
+            self.status_label = QLabel("就绪")
+            self.status_label.setObjectName("Muted")
+        if not hasattr(self, "admin_label"):
+            self.admin_label = QLabel(
+                "管理员" if core.is_admin() else "普通用户")
+            self.admin_label.setObjectName("Muted")
+
         root.addWidget(self._header())
         self.admin_banner = self._banner()
         root.addWidget(self.admin_banner)
@@ -732,10 +743,7 @@ class MainWindow(QMainWindow):
         w.setObjectName("Card")
         lay = QHBoxLayout(w)
         lay.setContentsMargins(12, 6, 12, 6)
-        self.status_label = QLabel("就绪")
-        self.status_label.setObjectName("Muted")
-        self.admin_label = QLabel("管理员" if core.is_admin() else "普通用户")
-        self.admin_label.setObjectName("Muted")
+        # 这两个标签在 _build_ui 开头就已创建，这里只负责摆放
         lay.addWidget(self.status_label, 1)
         lay.addWidget(self.admin_label)
         return w

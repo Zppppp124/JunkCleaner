@@ -175,7 +175,8 @@ def reset_clocks() -> dict[str, Any]:
 def stability_test(target_clock: int, seconds: int = 60,
                    progress: Callable[[str], None] | None = None,
                    stress: bool = False,
-                   lock_clock: bool = True) -> dict[str, Any]:
+                   lock_clock: bool = True,
+                   transient: bool = True) -> dict[str, Any]:
     """把时钟锁到目标频率并观察一段时间：温度、降频原因、是否掉频。
 
     注意：这不是「找最低电压」——电压不可控。它验证的是
@@ -198,7 +199,7 @@ def stability_test(target_clock: int, seconds: int = 60,
             from . import gpu_load
             backend = gpu_load.stress_backend()
             if backend.get("ok"):
-                loader = gpu_load.GpuStress()
+                loader = gpu_load.GpuStress(transient=transient)
                 loader.start()
                 if not loader.running:
                     stress_summary["note"] = (
@@ -213,6 +214,7 @@ def stability_test(target_clock: int, seconds: int = 60,
 
     samples: list[dict[str, Any]] = []
     start = time.time()
+    corruption = ""
     try:
         while time.time() - start < seconds:
             st = read_state()
@@ -231,9 +233,18 @@ def stability_test(target_clock: int, seconds: int = 60,
                     pass
             if loader and loader.errors:
                 break
+            # 静默数据损坏（算错但不报错）必须单独检查，否则会误判为稳定。
+            ext_now = getattr(loader, "_external", None) if loader else None
+            if ext_now is not None:
+                try:
+                    corruption = ext_now.corruption()
+                except Exception:  # noqa: BLE001
+                    corruption = ""
+                if corruption:
+                    break
             # 打包版使用外部 CUDA 进程做负载；若它异常退出（驱动重置），
             # 这里必须判为不稳定，否则会误报稳定。
-            ext = getattr(loader, "_external", None) if loader else None
+            ext = ext_now
             if ext is not None and not ext.alive and ext.returncode not in (None, 0):
                 loader.errors.append(
                     f"CUDA 负载进程异常退出（rc={ext.returncode}），"
@@ -252,6 +263,8 @@ def stability_test(target_clock: int, seconds: int = 60,
     stress_errors = list((stress_summary or {}).get("errors") or [])
     if loader is not None and loader.errors:
         stress_errors.extend(loader.errors)
+    if corruption:
+        stress_errors.append(corruption)
     stress_errors = list(dict.fromkeys(str(e) for e in stress_errors if e))
     # 只统计「真正的」降频原因；bit0 是 GpuIdle（空闲自动降频），不算问题
     real_throttle = 0

@@ -1,25 +1,27 @@
-"""硬件检测与测试页面：CPU / 内存 / 风扇。
+"""硬件检测与测试页面：CPU / 内存 / 显存 / 风扇。
 
 CPU-Z、MemTest86 都是专有软件，不可内嵌（见 docs\\licensing_notes.md）。
 本页用自研实现达到等价效果：
   * CPU 信息（CPUID 类公开接口）
   * CPU 跑分（单核 / 多核）+ 全核压力测试
   * 内存信息（SMBIOS）+ Windows 级内存测试
+  * 显存测试（内嵌开源 memtest_vulkan，zlib 许可）
   * 风扇能力检测（如实报告可用性）
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QMessageBox, QProgressBar, QPushButton, QSpinBox,
     QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from . import cpubench, fan, hwinfo, memtest
+from . import cpubench, fan, hwinfo, memtest, vramtest
 
 GOOD = "#2ec4a5"
 WARN = "#ff9f43"
@@ -85,6 +87,7 @@ class HardwarePage(QWidget):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._tab_cpu(), "CPU")
         self.tabs.addTab(self._tab_memory(), "内存")
+        self.tabs.addTab(self._tab_vram(), "显存")
         self.tabs.addTab(self._tab_fan(), "风扇")
         lay.addWidget(self.tabs, 1)
 
@@ -211,6 +214,55 @@ class HardwarePage(QWidget):
         self.mem_result.setColumnWidth(0, 200)
         mh.setSectionResizeMode(1, QHeaderView.Stretch)
         lay.addWidget(self.mem_result, 1)
+        return page
+
+    # ---------------- 显存页 ----------------
+    def _tab_vram(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setSpacing(9)
+
+        info = QLabel(
+            "显存稳定性测试（内嵌开源工具 memtest_vulkan，zlib 许可）。\n"
+            "它会反复写入并校验显存内容，能发现显存超频/老化导致的位错误——"
+            "这类错误常表现为游戏花屏或贴图异常，普通满载压测测不出来。\n"
+            "建议至少跑 6 分钟；测试期间请勿运行游戏或 3D 程序。")
+        info.setObjectName("Muted")
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        ctl = QGroupBox("测试设置")
+        g = QGridLayout(ctl)
+        self.spin_vram_min = QSpinBox()
+        self.spin_vram_min.setRange(1, 120)
+        self.spin_vram_min.setValue(6)
+        self.spin_vram_min.setSuffix(" 分钟")
+        self.spin_vram_min.setToolTip("建议至少 6 分钟；时间越长越容易暴露偶发错误")
+        self.btn_vram = QPushButton("开始显存测试")
+        self.btn_vram.setObjectName("Primary")
+        self.btn_vram.clicked.connect(self.run_vramtest)
+        self.btn_vram_stop = QPushButton("停止")
+        self.btn_vram_stop.setObjectName("Danger")
+        self.btn_vram_stop.setEnabled(False)
+        self.btn_vram_stop.clicked.connect(self.stop_vramtest)
+        self.lbl_vram_status = QLabel("未测试")
+        self.lbl_vram_status.setWordWrap(True)
+        g.addWidget(QLabel("测试时长"), 0, 0)
+        g.addWidget(self.spin_vram_min, 0, 1)
+        g.addWidget(self.btn_vram, 0, 2)
+        g.addWidget(self.btn_vram_stop, 0, 3)
+        g.addWidget(self.lbl_vram_status, 1, 0, 1, 4)
+        lay.addWidget(ctl)
+
+        self.vram_result = QTableWidget(0, 2)
+        self.vram_result.setHorizontalHeaderLabels(["项目", "结果"])
+        self.vram_result.verticalHeader().setVisible(False)
+        self.vram_result.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        vh = self.vram_result.horizontalHeader()
+        vh.setSectionResizeMode(0, QHeaderView.Fixed)
+        self.vram_result.setColumnWidth(0, 200)
+        vh.setSectionResizeMode(1, QHeaderView.Stretch)
+        lay.addWidget(self.vram_result, 1)
         return page
 
     # ---------------- 风扇页 ----------------
@@ -434,6 +486,117 @@ class HardwarePage(QWidget):
         if getattr(self, "_tester", None):
             self._tester.cancel()
             self.progress.setFormat("正在停止内存测试…")
+
+    # ---------------- 显存测试 ----------------
+    def run_vramtest(self) -> None:
+        if not vramtest.available():
+            QMessageBox.warning(
+                self, "不可用",
+                "未找到内嵌的 memtest_vulkan.exe，无法进行显存测试。")
+            return
+        minutes = self.spin_vram_min.value()
+        if QMessageBox.question(
+                self, "显存测试",
+                f"开始显存稳定性测试，时长约 {minutes} 分钟？\n\n"
+                "测试会持续满载显存并逐字节校验，期间请勿运行游戏或\n"
+                "3D 程序。可随时点「停止」，但未跑完时结论不完整。\n\n"
+                "该功能用于排查花屏/贴图异常是否由显存不稳引起。"
+        ) != QMessageBox.Yes:
+            return
+        self._vram = vramtest.VramTest()
+        r = self._vram.start()
+        if not r.get("ok"):
+            QMessageBox.warning(self, "启动失败", str(r.get("error")))
+            return
+        self._vram_deadline = time.time() + minutes * 60
+        self.btn_vram.setEnabled(False)
+        self.btn_vram_stop.setEnabled(True)
+        self.vram_result.setRowCount(0)
+        self.lbl_vram_status.setText("测试中…")
+        if not hasattr(self, "_vram_timer"):
+            self._vram_timer = QTimer(self)
+            self._vram_timer.setInterval(1000)
+            self._vram_timer.timeout.connect(self._poll_vramtest)
+        self._vram_timer.start()
+
+    def _poll_vramtest(self) -> None:
+        t = getattr(self, "_vram", None)
+        if t is None:
+            return
+        snap = t.poll()
+        elapsed_ok = time.time() >= getattr(self, "_vram_deadline", 0)
+        self.lbl_vram_status.setText(
+            f"运行中：{snap['device'] or '正在识别显卡'}　"
+            f"迭代 {snap['iterations']}　"
+            f"已校验 {snap['checked_gb']}GB　"
+            f"{snap['speed_gb_s']}GB/s　"
+            f"错误 {snap['error_count']}")
+        self.progress.setFormat(
+            f"显存测试：迭代 {snap['iterations']}　"
+            f"校验 {snap['checked_gb']}GB")
+        if snap["error_count"]:
+            self.lbl_vram_status.setText(
+                f"<span style='color:{DANGER}'>检出显存错误！</span>　"
+                f"迭代 {snap['iterations']}　"
+                f"已校验 {snap['checked_gb']}GB")
+        # 到达设定时长 或 已得出结论 或 进程意外退出 → 收尾
+        if elapsed_ok or snap["finished"] or not snap["running"]:
+            if elapsed_ok and snap["running"]:
+                t.stop()
+            self._finish_vramtest()
+
+    def _finish_vramtest(self) -> None:
+        if hasattr(self, "_vram_timer"):
+            self._vram_timer.stop()
+        t = getattr(self, "_vram", None)
+        self.btn_vram.setEnabled(True)
+        self.btn_vram_stop.setEnabled(False)
+        if t is None:
+            return
+        snap = t.summary()
+        self._render_vram_result(snap)
+
+    def stop_vramtest(self) -> None:
+        t = getattr(self, "_vram", None)
+        if t and t.running:
+            self.progress.setFormat("正在停止显存测试…")
+            self._finish_vramtest()
+
+    def _render_vram_result(self, snap: dict) -> None:
+        passed = snap.get("passed")
+        if passed is True:
+            verdict, color = "未发现显存错误", GOOD
+        elif passed is False:
+            verdict, color = "检出显存错误", DANGER
+        elif snap.get("stopped_by_user"):
+            verdict, color = "已停止（结论不完整）", WARN
+        else:
+            verdict, color = "尚未得出结果", MUTED
+        self.lbl_vram_status.setText(
+            f"<span style='color:{color};font-weight:700'>{verdict}</span>")
+        rows = [
+            ("显卡", snap.get("device") or "—"),
+            ("结论", verdict),
+            ("迭代次数", str(snap.get("iterations", 0))),
+            ("写入显存", f"{snap.get('written_gb', 0):.1f} GB"),
+            ("校验显存", f"{snap.get('checked_gb', 0):.1f} GB"),
+            ("峰值带宽", f"{snap.get('speed_gb_s', 0):.1f} GB/s"),
+            ("错误条数", str(snap.get("error_count", 0))),
+        ]
+        for e in snap.get("errors") or []:
+            rows.append(("错误详情", e))
+        self.vram_result.setRowCount(len(rows))
+        for i, (k, v) in enumerate(rows):
+            self.vram_result.setItem(i, 0, QTableWidgetItem(str(k)))
+            item = QTableWidgetItem(str(v))
+            if k == "结论":
+                item.setForeground(Qt.darkGreen if passed is True
+                                   else (Qt.red if passed is False
+                                         else Qt.darkYellow))
+            self.vram_result.setItem(i, 1, item)
+        self.progress.setFormat("显存测试结束")
+        if self.notify:
+            self.notify("显存测试完成", verdict)
 
     def _on_memtest(self, _kind: str, r: dict[str, Any]) -> None:
         self.btn_mem.setEnabled(True)

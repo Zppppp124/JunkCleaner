@@ -37,6 +37,10 @@ class UndervoltResult:
     original_mv: float = 0.0
     best_mv: float = 0.0
     lowest_stable_mv: float = 0.0
+    # 建议电压 = 最低稳定电压 + 安全余量。压测是稳态负载，游戏是瞬态负载，
+    # 直接用最低稳定值作为日常电压容易在游戏里花屏，所以留一点余量。
+    suggested_mv: float = 0.0
+    margin_mv: float = 0.0
     attempts: list[dict[str, Any]] = field(default_factory=list)
     ok: bool = False
     error: str = ""
@@ -57,6 +61,8 @@ class AdaptiveUndervolt:
                  window_mhz: float = 200.0,
                  max_steps: int = 0,
                  section: str = "Profile1",
+                 margin_mv: float = 25.0,
+                 transient: bool = True,
                  progress: Callable[[str], None] | None = None) -> None:
         self.freq = int(freq)
         self.test_seconds = int(test_seconds)
@@ -65,6 +71,8 @@ class AdaptiveUndervolt:
         self.window = float(window_mhz)
         self.max_steps = int(max_steps)   # 0 = 不限
         self.section = section or "Profile1"
+        self.margin = max(0.0, float(margin_mv))
+        self.transient = bool(transient)
         self.progress = progress or (lambda _m: None)
         self.profile: Path | None = None
         self.backup: Path | None = None
@@ -139,7 +147,7 @@ class AdaptiveUndervolt:
         # 这里只跑负载，频率由曲线平台决定。
         r = gpu.stability_test(self.freq, seconds=self.test_seconds,
                                progress=self._log, stress=True,
-                               lock_clock=False)
+                               lock_clock=False, transient=self.transient)
         r["mv"] = mv
         if not r.get("stressed"):
             note = (r.get("stress") or {}).get("note") or "未启动满载负载"
@@ -236,6 +244,15 @@ class AdaptiveUndervolt:
                 mv -= self.step
 
             res.lowest_stable_mv = stable_mv
+            # 建议值加安全余量：稳态压测通过 ≠ 游戏瞬态负载也稳。
+            # 余量取「向上回退一档」，且不超过原始电压。
+            suggested = stable_mv + self.margin
+            if self.step > 0:
+                steps = int(round(self.margin / self.step)) or 1
+                suggested = stable_mv + steps * self.step
+            suggested = min(float(suggested), float(orig))
+            res.margin_mv = round(suggested - stable_mv, 1)
+            res.suggested_mv = suggested
             res.ok = stable_mv < float(orig)
             if not res.ok and not res.error:
                 res.error = "未找到比原始更低的稳定电压"

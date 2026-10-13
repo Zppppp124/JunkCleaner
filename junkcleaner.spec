@@ -17,6 +17,15 @@ _datas = [
     ("junkcleaner/assets/app.ico", "junkcleaner/assets"),
     ("junkcleaner/assets/app.png", "junkcleaner/assets"),
 ]
+# 显存测试工具（zlib 许可，允许随程序分发，需保留版权声明）
+_vram_exe = "junkcleaner/assets/memtest_vulkan.exe"
+_vram_lic = "junkcleaner/assets/LICENSE-memtest_vulkan.txt"
+for _f in (_vram_exe, _vram_lic):
+    if os.path.exists(_f):
+        _datas.append((_f, "junkcleaner/assets"))
+        print(f"[spec] 内嵌 {_f}")
+    else:
+        print(f"[spec] 警告：缺少 {_f}")
 if os.environ.get("JUNKCLEANER_BUNDLE_AB") == "1":
     _ab_zip = "junkcleaner/assets/MSIAfterburnerSetup.zip"
     if os.path.exists(_ab_zip):

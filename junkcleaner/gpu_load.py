@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -87,19 +88,55 @@ def system_python_with_torch() -> str:
 HELPER = r'''
 import sys, time
 import torch
+
+# argv: duration  transient(0/1)  high_ms  low_ms
+duration = float(sys.argv[1])
+transient = bool(int(sys.argv[2])) if len(sys.argv) > 2 else False
+high_ms = float(sys.argv[3]) if len(sys.argv) > 3 else 120.0
+low_ms = float(sys.argv[4]) if len(sys.argv) > 4 else 60.0
+
 torch.cuda.set_device(0)
 n = 4096
 dt = torch.float16
 a = torch.randn(n, n, device="cuda", dtype=dt) * 0.1
 b = torch.randn(n, n, device="cuda", dtype=dt) * 0.1
 host = torch.empty(1024, 1024, dtype=dt)
-deadline = time.time() + float(sys.argv[1])
-while time.time() < deadline:
+deadline = time.time() + duration
+bad = 0
+
+def heavy():
+    global a
     for _ in range(8):
         a = torch.relu(a @ b) * 0.001
         c = torch.matmul(a, b)
     host.copy_(c[:1024, :1024], non_blocking=True)
     torch.cuda.synchronize()
+    return c
+
+def validate(c):
+    """降压不稳的典型表现是「时钟正常但算错」——这类静默数据损坏
+    不会抛 CUDA 异常，只能靠校验结果发现，否则会误判为稳定。"""
+    if not torch.isfinite(c).all().item():
+        return "CORRUPT:nonfinite"
+    peak = c.abs().max().item()
+    if peak != peak or peak > 1e6:
+        return "CORRUPT:peak"
+    return ""
+
+while time.time() < deadline:
+    c = heavy()
+    msg = validate(c)
+    if msg:
+        bad += 1
+        print(msg, flush=True)
+        break
+    if transient:
+        # 瞬态负载：在满载与轻载之间反复跳变，制造电流突变（dv/dt）。
+        # 游戏卡顿/花屏多由这种瞬态压降引起，恒定满载测不出来。
+        torch.cuda.synchronize()
+        time.sleep(low_ms / 1000.0)
+
+print("OK" if bad == 0 else "BAD", flush=True)
 print("DONE")
 '''
 
@@ -107,22 +144,35 @@ print("DONE")
 class ExternalStress:
     """在独立 Python 进程里跑 CUDA 负载（打包后的 exe 用）。"""
 
-    def __init__(self, seconds: int) -> None:
+    def __init__(self, seconds: int, transient: bool = False,
+                 high_ms: float = 120.0, low_ms: float = 60.0) -> None:
         self.seconds = int(seconds)
+        self.transient = bool(transient)
+        self.high_ms = float(high_ms)
+        self.low_ms = float(low_ms)
         self.proc: subprocess.Popen | None = None
         self.python = system_python_with_torch()
+        # 把子进程输出写到临时文件，用于读取「静默数据损坏」标记。
+        # 用文件而不是管道，避免父进程不读取时管道写满导致子进程阻塞。
+        self.log_path = Path(tempfile.gettempdir()) / (
+            f"jc_gpu_stress_{os.getpid()}_{int(time.time())}.log")
+        self._fh = None
 
     def start(self) -> bool:
         if not self.python:
             return False
         flags = 0x08000000 if os.name == "nt" else 0
         try:
+            self._fh = open(self.log_path, "wb")
             self.proc = subprocess.Popen(
-                [self.python, "-c", HELPER, str(self.seconds)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                [self.python, "-c", HELPER, str(self.seconds),
+                 "1" if self.transient else "0",
+                 str(self.high_ms), str(self.low_ms)],
+                stdout=self._fh, stderr=subprocess.STDOUT,
                 creationflags=flags)
             return True
         except Exception:  # noqa: BLE001
+            self._close_fh()
             return False
 
     def stop(self) -> None:
@@ -135,6 +185,34 @@ class ExternalStress:
                     self.proc.kill()
                 except Exception:  # noqa: BLE001
                     pass
+        self._close_fh()
+
+    def _close_fh(self) -> None:
+        try:
+            if self._fh and not self._fh.closed:
+                self._fh.flush()
+                self._fh.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def output(self) -> str:
+        """读取子进程输出（含 CORRUPT / OK 标记）。"""
+        try:
+            if self._fh and not self._fh.closed:
+                self._fh.flush()
+            return self.log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def corruption(self) -> str:
+        """若负载期间检出数值损坏，返回原因；否则返回空串。"""
+        text = self.output()
+        for line in text.splitlines():
+            if line.startswith("CORRUPT"):
+                return line.strip()
+        if "BAD" in text.split():
+            return "负载期间检出计算结果损坏（花屏/静默数据错误的典型表现）"
+        return ""
 
     @property
     def alive(self) -> bool:
@@ -156,9 +234,14 @@ def device_name() -> str:
 class GpuStress:
     """在后台线程持续给 GPU 加载。"""
 
-    def __init__(self, size: int = 4096, use_fp16: bool = True) -> None:
+    def __init__(self, size: int = 4096, use_fp16: bool = True,
+                 transient: bool = False,
+                 high_ms: float = 120.0, low_ms: float = 60.0) -> None:
         self.size = size
         self.use_fp16 = use_fp16
+        self.transient = bool(transient)
+        self.high_ms = float(high_ms)
+        self.low_ms = float(low_ms)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._external: ExternalStress | None = None
@@ -186,6 +269,11 @@ class GpuStress:
                 host.copy_(c[:1024, :1024], non_blocking=True)
                 torch.cuda.synchronize()
                 self.iterations += 1
+                # 静默数据损坏检测：时钟正常但算错，必须主动校验
+                if not bool(torch.isfinite(c).all().item()):
+                    self.errors.append(
+                        "检出计算结果损坏（非有限值）——降压不稳的典型表现")
+                    break
                 a = torch.randn(n, n, device="cuda", dtype=dt) * 0.1
         except Exception as exc:  # noqa: BLE001
             self.errors.append(str(exc))
@@ -196,7 +284,8 @@ class GpuStress:
         self._stop.clear()
         self.start_time = time.time()
         if self._use_external:
-            ext = ExternalStress(seconds=3600)
+            ext = ExternalStress(seconds=3600, transient=self.transient,
+                                 high_ms=self.high_ms, low_ms=self.low_ms)
             if ext.start():
                 self._external = ext
                 # 确认外部 CUDA 进程没有立刻退出（缺 DLL / 驱动不匹配
@@ -228,8 +317,18 @@ class GpuStress:
         return bool(self._thread and self._thread.is_alive())
 
     def summary(self) -> dict[str, Any]:
+        corruption = ""
+        if self._external is not None:
+            try:
+                corruption = self._external.corruption()
+            except Exception:  # noqa: BLE001
+                corruption = ""
+        errors = list(self.errors[:3])
+        if corruption:
+            errors.append(corruption)
         return {"iterations": self.iterations,
-                "errors": self.errors[:3],
+                "errors": errors,
+                "corruption": corruption,
                 "seconds": time.time() - self.start_time if self.start_time else 0}
 
 
