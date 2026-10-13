@@ -1,0 +1,33 @@
+simple-nvidia-undervolt
+Copyright (c) 2026 vuplea
+https://github.com/vuplea/simple-nvidia-undervolt
+
+本目录下的 simple-nvidia-undervolt.exe 为上述项目的官方发布二进制文件
+(Release v1.0.9，SHA-256: 0b19f92b003cd9d6566dfbe83a8446e7d5dd402a93a4930405901d199e720b86)。
+JunkCleaner 仅在获得其许可证许可的前提下随程序一并分发，未做任何修改。
+
+该工具通过 NVIDIA NVAPI（Pstates20 接口）直接读写显卡的 V/F 曲线，
+不需要 MSI Afterburner，也不安装内核驱动。
+
+--------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2026 vuplea
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

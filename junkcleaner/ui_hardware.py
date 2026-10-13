@@ -57,9 +57,10 @@ class HardwarePage(QWidget):
         self._worker: QThread | None = None
         self._info: dict[str, Any] = {}
         self._build()
-        # 延迟到事件循环启动后再检测，避免阻塞主窗口构建
+        # 延迟到事件循环启动后再检测；检测本身（hwinfo + 风扇探测）
+        # 实测要 1 秒以上，必须放到后台线程，否则启动瞬间界面卡死。
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(400, self.refresh_info)
+        QTimer.singleShot(400, self.refresh_info_async)
         # CPU 当前频率会随睿频/负载变化，单独定时刷新（1.5 秒一次）
         self._freq_timer = QTimer(self)
         self._freq_timer.setInterval(1500)
@@ -338,6 +339,36 @@ class HardwarePage(QWidget):
         return page
 
     # ---------------- 数据 ----------------
+    def shutdown(self) -> None:
+        """关闭窗口前停止定时器并等待后台线程（避免退出时崩溃）。"""
+        try:
+            self._freq_timer.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        if hasattr(self, "_vram_timer"):
+            try:
+                self._vram_timer.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        for attr in ("_worker",):
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            try:
+                if w.isRunning():
+                    w.quit()
+                    if not w.wait(3000):
+                        w.terminate()
+                        w.wait(1000)
+            except Exception:  # noqa: BLE001
+                pass
+        t = getattr(self, "_vram", None)
+        if t is not None:
+            try:
+                t.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _refresh_cpu_freq(self) -> None:
         """定时刷新 CPU 当前频率（睿频会变，基准频率不会）。"""
         try:
@@ -363,6 +394,33 @@ class HardwarePage(QWidget):
         except Exception as exc:  # noqa: BLE001
             self.lbl_sys.setText(f"检测失败：{exc}")
             return
+        self._render_info()
+
+    def refresh_info_async(self) -> None:
+        """后台执行硬件检测（collect_all + 风扇探测约 1 秒以上）。"""
+        if self._worker and self._worker.isRunning():
+            return
+        self.lbl_sys.setText("正在检测硬件…")
+
+        def work(_progress: Any = None) -> dict:
+            # 风扇探测（fan.status）实测要 300ms 以上，一并放到后台，
+            # 否则检测完成回填时会卡住主线程。
+            return {"info": hwinfo.collect_all(), "fan": fan.status()}
+
+        self._worker = Worker("硬件检测", work)
+        self._worker.done.connect(self._on_info_loaded)
+        self._worker.start()
+
+    def _on_info_loaded(self, _kind: str, r: dict) -> None:
+        if r.get("error"):
+            self.lbl_sys.setText(f"检测失败：{r['error']}")
+            return
+        self._info = r.get("info") or {}
+        self._fan_status = r.get("fan") or {}
+        self._render_info()
+
+    def _render_info(self) -> None:
+        """把已取得的硬件信息渲染到界面（主线程，纯 UI 操作）。"""
         cpu = self._info.get("cpu", {})
         board = self._info.get("board", {})
         self.lbl_sys.setText(
@@ -414,7 +472,9 @@ class HardwarePage(QWidget):
         self.set_status("硬件检测完成")
 
     def _render_fan(self) -> None:
-        s = fan.status()
+        # 优先使用后台线程取回的结果；没有则回退到同步调用
+        # （异步路径已在 _on_info_loaded 里预取，正常不会走到这里）
+        s = getattr(self, "_fan_status", None) or fan.status()
         cpu = s["cpu"]
         lines = [f"<b>可读性：</b>{'可以' if cpu.get('readable') else '不可以'}"
                  f"　检测到风扇 {cpu.get('fan_count', 0)} 个"]

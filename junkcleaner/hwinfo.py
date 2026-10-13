@@ -16,10 +16,92 @@ import ctypes
 import json
 import re
 import struct
+import time
 from dataclasses import dataclass, field, asdict
 from typing import Any
 
 from . import core
+
+
+_pdh_state: dict[str, Any] = {}
+
+
+def _pdh_percent() -> float:
+    """用 Windows PDH API 直接读 `% Processor Performance`。
+
+    为什么不用 PowerShell 的 Get-Counter：实测每次要 1.2 秒（进程启动
+    开销），放在定时刷新里会让界面明显卡顿。PDH 是 Get-Counter 的底层
+    接口，直接 ctypes 调用只要 0.1ms 量级。
+
+    注意：性能计数器需要两次采集才能出值，首次调用只做基线。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:  # noqa: BLE001
+        return 0.0
+    try:
+        pdh = _pdh_state.get("pdh")
+        if pdh is None:
+            pdh = ctypes.WinDLL("pdh")
+            # 必须显式声明参数与返回类型：PDH 句柄是 64 位，
+            # 不声明的话 ctypes 会按 int 截断，导致后续取值一直失败。
+            pdh.PdhOpenQueryW.restype = wintypes.DWORD
+            pdh.PdhOpenQueryW.argtypes = [
+                wintypes.LPCWSTR, ctypes.c_size_t,
+                ctypes.POINTER(wintypes.HANDLE)]
+            pdh.PdhAddEnglishCounterW.restype = wintypes.DWORD
+            pdh.PdhAddEnglishCounterW.argtypes = [
+                wintypes.HANDLE, wintypes.LPCWSTR, ctypes.c_size_t,
+                ctypes.POINTER(wintypes.HANDLE)]
+            pdh.PdhCollectQueryData.restype = wintypes.DWORD
+            pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
+            pdh.PdhGetFormattedCounterValue.restype = wintypes.DWORD
+            pdh.PdhGetFormattedCounterValue.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p,
+                ctypes.c_void_p]
+            pdh.PdhCloseQuery.restype = wintypes.DWORD
+            pdh.PdhCloseQuery.argtypes = [wintypes.HANDLE]
+            ph = wintypes.HANDLE()
+            if pdh.PdhOpenQueryW(None, 0, ctypes.byref(ph)) != 0:
+                return 0.0
+            counter = wintypes.HANDLE()
+            path = (r"\Processor Information(_Total)"
+                    r"\% Processor Performance")
+            if pdh.PdhAddEnglishCounterW(ph, path, 0,
+                                         ctypes.byref(counter)) != 0:
+                pdh.PdhCloseQuery(ph)
+                return 0.0
+            _pdh_state.update({"pdh": pdh, "query": ph, "counter": counter,
+                               "last_t": 0.0, "last_pct": 0.0})
+            # 首次采集只建立基线（否则返回的是无效值）
+            pdh.PdhCollectQueryData(ph)
+            _pdh_state["last_t"] = time.time()
+            return 0.0
+        # 速率类计数器必须有采样间隔；间隔过短会算出明显失真的值。
+        # 间隔不足时直接复用上次结果，避免读到 7000MHz 这种异常值。
+        now = time.time()
+        if now - float(_pdh_state.get("last_t") or 0.0) < 0.5:
+            return float(_pdh_state.get("last_pct") or 0.0)
+        pdh.PdhCollectQueryData(_pdh_state["query"])
+        _pdh_state["last_t"] = now
+
+        class _VAL(ctypes.Structure):
+            _fields_ = [("CStatus", wintypes.DWORD),
+                        ("doubleValue", ctypes.c_double)]
+
+        val = _VAL()
+        st = pdh.PdhGetFormattedCounterValue(
+            _pdh_state["counter"], 0x00000200, None, ctypes.byref(val))
+        if st != 0 or val.CStatus != 0:
+            return 0.0
+        pct = float(val.doubleValue)
+        if pct <= 0:
+            return 0.0
+        _pdh_state["last_pct"] = pct
+        return pct
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def current_freq_mhz() -> int:
@@ -43,21 +125,12 @@ def current_freq_mhz() -> int:
         return 0
     if base <= 0:
         return 0
-    # 优先用性能计数器（能反映睿频）
-    try:
-        proc = core.run_powershell(
-            "[int]((Get-Counter "
-            "'\\Processor Information(_Total)\\% Processor Performance' "
-            "-ErrorAction SilentlyContinue).CounterSamples.CookedValue)",
-            timeout=20)
-        text = (proc.stdout or b"").decode("utf-8", "replace").strip()
-        pct = int(float(text))
-        if pct > 0:
-            mhz = int(base * pct / 100.0)
-            if 100 <= mhz <= 10000:
-                return mhz
-    except Exception:  # noqa: BLE001
-        pass
+    # 优先用 PDH 性能计数器（能反映睿频，且开销极低）
+    pct = _pdh_percent()
+    if pct > 0:
+        mhz = int(base * pct / 100.0)
+        if 100 <= mhz <= 10000:
+            return mhz
     # 退回 CallNtPowerInformation（部分机器能反映实时值）
     try:
         import ctypes

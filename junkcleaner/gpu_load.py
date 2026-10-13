@@ -124,17 +124,31 @@ def validate(c):
     return ""
 
 while time.time() < deadline:
-    c = heavy()
-    msg = validate(c)
-    if msg:
-        bad += 1
-        print(msg, flush=True)
-        break
     if transient:
-        # 瞬态负载：在满载与轻载之间反复跳变，制造电流突变（dv/dt）。
-        # 游戏卡顿/花屏多由这种瞬态压降引起，恒定满载测不出来。
+        # 瞬态负载：先持续 high_ms 毫秒真满载，再落到 low_ms 毫秒轻载。
+        # 关键：满载段必须真的压满（持续发射 kernel），只在交界面制造
+        # 电流突变（dv/dt）。若满载段只跑一次矩阵乘就睡，占空比过低，
+        # GPU 永远到不了满载功耗，测不出真实工况。
+        heavy_until = time.time() + high_ms / 1000.0
+        last_c = None
+        while time.time() < heavy_until:
+            last_c = heavy()
+        if last_c is not None:
+            msg = validate(last_c)
+            if msg:
+                bad += 1
+                print(msg, flush=True)
+                break
+        # 轻载窗口：不发射 kernel，让核心时钟与电流落下
         torch.cuda.synchronize()
         time.sleep(low_ms / 1000.0)
+    else:
+        c = heavy()
+        msg = validate(c)
+        if msg:
+            bad += 1
+            print(msg, flush=True)
+            break
 
 print("OK" if bad == 0 else "BAD", flush=True)
 print("DONE")

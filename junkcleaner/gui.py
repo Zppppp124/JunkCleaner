@@ -227,6 +227,59 @@ class CleanWorker(QThread):
 
 
 # ---------------------------------------------------------------- 主窗口
+class GuardCheckWorker(QThread):
+    """后台做守护自检（进程枚举约 1 秒，不能放主线程）。"""
+
+    done = Signal(dict)
+
+    def run(self) -> None:
+        data: dict[str, Any] = {}
+        try:
+            data["installed"] = guard.autostart_installed()
+        except Exception:  # noqa: BLE001
+            data["installed"] = False
+        try:
+            data["external_running"] = guard.guard_process_running()
+        except Exception:  # noqa: BLE001
+            data["external_running"] = False
+        try:
+            data["status_running"] = bool(
+                core.read_status().get("guard_running"))
+        except Exception:  # noqa: BLE001
+            data["status_running"] = False
+        self.done.emit(data)
+
+
+class DefenderApplyWorker(QThread):
+    """后台执行 Defender 策略自动应用（内含 gpupdate，约 5 秒）。"""
+
+    done = Signal(dict)
+
+    def __init__(self, parent: Any = None) -> None:
+        super().__init__(parent)
+        self._page = None
+
+    def run(self) -> None:
+        data: dict[str, Any] = {}
+        try:
+            if not core.is_admin():
+                self.done.emit({"skipped": "not-admin"})
+                return
+            cfg = core.load_config()
+            if not cfg.get("defender_auto_apply"):
+                self.done.emit({"skipped": "disabled"})
+                return
+            import junkcleaner.defender as _def
+            preset = cfg.get("defender_preset", "balanced")
+            r = _def.apply_preset(preset)
+            data["applied"] = r.get("applied", 0)
+            data["detail"] = (f"{_def.PRESET_LABEL.get(preset, preset)}："
+                              f"应用 {r.get('applied', 0)} 项")
+        except Exception as exc:  # noqa: BLE001
+            data["error"] = str(exc)
+        self.done.emit(data)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -250,12 +303,21 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(1200, self._auto_apply_defender)
 
     def _auto_apply_defender(self) -> None:
-        """启动时按配置自动应用 Defender 策略（需管理员 + 用户已开启）。"""
-        try:
-            self.defender_page.auto_apply_on_start()
-        except Exception as exc:  # noqa: BLE001
-            core.log(f"自动应用 Defender 策略失败: {exc}", level="ERROR",
-                     source="defender")
+        """启动时按配置自动应用 Defender 策略（需管理员 + 用户已开启）。
+
+        这条路径内部会执行 `gpupdate /force`，实测约 5 秒。
+        必须放后台，否则启动后 1.2 秒界面会卡死 5 秒。
+        """
+        self._defender_worker = DefenderApplyWorker(self)
+        self._defender_worker.done.connect(self._on_defender_applied)
+        self._defender_worker.start()
+
+    def _on_defender_applied(self, data: dict) -> None:
+        if data.get("error"):
+            core.log(f"自动应用 Defender 策略失败: {data['error']}",
+                     level="ERROR", source="defender")
+        elif data.get("applied") and self.notify:
+            self.notify("Defender 策略已自动优化", str(data.get("detail", "")))
 
     def _tick(self) -> None:
         """每两秒刷新守护状态与拦截记录。"""
@@ -1027,15 +1089,15 @@ class MainWindow(QMainWindow):
 
     # ---------------- 守护逻辑 ----------------
     def _maybe_autostart_guard(self) -> None:
+        """启动时的守护自检。
+
+        `guard_process_running()` 要遍历所有进程并读命令行，
+        实测约 1 秒；`guard.stop_external_guards()` 类似。
+        这些必须放后台，否则启动瞬间界面会卡住。
+        """
         if self.guard_watcher is None:
             self.guard_watcher = guard.InstallerWatcher(notify=self.notify)
-        try:
-            installed = guard.autostart_installed()
-            self.check_autostart.blockSignals(True)
-            self.check_autostart.setChecked(installed)
-            self.check_autostart.blockSignals(False)
-        except Exception:  # noqa: BLE001
-            pass
+        # 读配置很快，直接在主线程完成
         cfg = core.load_config()
         self.spin_interval.blockSignals(True)
         self.spin_interval.setValue(int(cfg.get("guard_interval", 2) or 2))
@@ -1045,14 +1107,23 @@ class MainWindow(QMainWindow):
         self.check_autoq.blockSignals(False)
         self._refresh_custom_list()
         self._refresh_ignore_list()
-        # 优先接管已有的独立守护，保持单一实例
-        if guard.guard_process_running():
-            self._start_guard_thread()
-        elif core.read_status().get("guard_running"):
+        self.refresh_events()
+        # 重活（进程枚举 + 自启检测）放后台
+        self._guard_check = GuardCheckWorker(self)
+        self._guard_check.done.connect(self._on_guard_checked)
+        self._guard_check.start()
+
+    def _on_guard_checked(self, data: dict) -> None:
+        try:
+            self.check_autostart.blockSignals(True)
+            self.check_autostart.setChecked(bool(data.get("installed")))
+            self.check_autostart.blockSignals(False)
+        except Exception:  # noqa: BLE001
+            pass
+        if data.get("external_running") or data.get("status_running"):
             self._start_guard_thread()
         else:
             self._sync_guard_ui()
-        self.refresh_events()
 
     def _start_guard_thread(self) -> None:
         # 若计划任务已在后台运行，先接管，避免两个守护同时工作
@@ -1287,6 +1358,32 @@ class MainWindow(QMainWindow):
         self._timer.stop()
         self.trust_page.shutdown()
         self.memory_page.shutdown()
+        # 启动时的后台任务（守护自检 / Defender 策略应用）也要等结束。
+        # 其中 Defender 应用内部会跑 gpupdate（约 5 秒），
+        # 线程未收尾就退出会让进程以 0xc0000409 崩溃。
+        for attr in ("_guard_check", "_defender_worker"):
+            w = getattr(self, attr, None)
+            if w is None:
+                continue
+            try:
+                if w.isRunning():
+                    w.wait(8000)
+            except Exception:  # noqa: BLE001
+                pass
+        # 这两个页面有后台刷新线程，必须等它们结束再退出，
+        # 否则线程存活时销毁窗口会导致进程异常退出（0xc0000409）。
+        try:
+            self.tuning_page.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.hardware_page.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.defender_page.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
         if self.guard_watcher and self.guard_watcher.running:
             self.hide()
             self.tray.show()

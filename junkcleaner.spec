@@ -26,6 +26,17 @@ for _f in (_vram_exe, _vram_lic):
         print(f"[spec] 内嵌 {_f}")
     else:
         print(f"[spec] 警告：缺少 {_f}")
+
+# NVAPI 降压工具（MIT 许可，允许随程序分发，需保留版权声明）
+# 有了它就不再需要 MSI Afterburner（专有软件，不可再分发）。
+_nv_exe = "junkcleaner/assets/simple-nvidia-undervolt.exe"
+_nv_lic = "junkcleaner/assets/LICENSE-simple-nvidia-undervolt.txt"
+for _f in (_nv_exe, _nv_lic):
+    if os.path.exists(_f):
+        _datas.append((_f, "junkcleaner/assets"))
+        print(f"[spec] 内嵌 {_f}")
+    else:
+        print(f"[spec] 警告：缺少 {_f}")
 if os.environ.get("JUNKCLEANER_BUNDLE_AB") == "1":
     _ab_zip = "junkcleaner/assets/MSIAfterburnerSetup.zip"
     if os.path.exists(_ab_zip):
@@ -46,6 +57,7 @@ hiddenimports = [
     "junkcleaner.fan", "junkcleaner.hwinfo", "junkcleaner.cpubench",
     "junkcleaner.gpu_live",
     "junkcleaner.localgpo",
+    "junkcleaner.nvbackend", "junkcleaner.nvundervolt",
     "junkcleaner.memtest", "junkcleaner.ui_hardware",
     "junkcleaner.afterburner", "junkcleaner.silent_uninstall",
     "junkcleaner.vramtest",

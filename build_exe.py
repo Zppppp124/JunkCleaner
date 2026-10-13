@@ -44,14 +44,15 @@ def main() -> int:
     print(" JunkCleaner 打包")
     print("=" * 60)
 
-    # --bundle-ab：把 Afterburner 安装包一起打进 exe（体积 +42MB）
+    # --bundle-ab 为旧版兼容参数：当前版本改用 NVAPI，不再需要
+    # 内嵌 MSI Afterburner 安装包。
     bundle_ab = "--bundle-ab" in sys.argv
     if bundle_ab:
         os.environ["JUNKCLEANER_BUNDLE_AB"] = "1"
-        print("模式：内嵌 Afterburner 安装包（开箱即用，体积更大）")
+        print("模式：旧版兼容（仅当 assets 中存在 Afterburner 安装包时内嵌）")
     else:
         os.environ.pop("JUNKCLEANER_BUNDLE_AB", None)
-        print("模式：标准（需要 Afterburner 时再联网获取或手动放置）")
+        print("模式：标准（内嵌 NVAPI 调参组件与显存测试）")
     print("-" * 60)
     try:
         py = ensure_venv()

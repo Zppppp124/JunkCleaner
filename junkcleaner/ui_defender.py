@@ -177,6 +177,24 @@ class DefenderPage(QWidget):
         self._worker.done.connect(self._on_status)
         self._worker.start()
 
+    def shutdown(self) -> None:
+        """关闭窗口前等待后台线程结束。
+
+        构造时就启动了 StatusWorker 查询状态；若进程退出时线程仍在跑，
+        Qt 会在线程存活的情况下析构对象，导致进程以 0xc0000409 异常退出。
+        """
+        w = getattr(self, "_worker", None)
+        if w is None:
+            return
+        try:
+            if w.isRunning():
+                w.quit()
+                if not w.wait(3000):
+                    w.terminate()
+                    w.wait(1000)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _render_preview(self) -> None:
         preset = self.cmb_preset.currentData()
         rows = defender.preview(preset)
