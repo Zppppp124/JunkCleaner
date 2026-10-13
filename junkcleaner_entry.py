@@ -112,6 +112,11 @@ def main() -> int:
         from junkcleaner import gpu
         _boot_log("applying saved GPU profile ...")
         return 0 if gpu.apply_saved_profile().get("ok") else 1
+    if "--cpu-bench-worker" in argv:
+        # CPU 多核跑分的子进程：只跑负载并输出耗时，不启动 GUI
+        from junkcleaner import cpubench
+        idx = argv.index("--cpu-bench-worker")
+        return cpubench.worker_cli(argv[idx + 1:])
     if argv and argv[0] != "--gui":
         from junkcleaner import cli
         return cli.main(argv)
@@ -123,4 +128,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     os.environ.setdefault("JUNKCLEANER_VERBOSE", "0")
+    # 冻结环境下必须调用：CPU 跑分使用 multiprocessing，
+    # 子进程会重新执行本入口；没有它子进程会再次启动整个 GUI
+    # （或直接因句柄/权限失败），表现为「跑分没反应」。
+    import multiprocessing
+    multiprocessing.freeze_support()
     raise SystemExit(main())

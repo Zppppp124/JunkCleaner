@@ -13,8 +13,9 @@ Windows 运行时内核与驱动已占用部分物理页，用户态无法碰，
   全0 / 全1 / 0x5555 / 0xAAAA / 0x3333 / 0xCCCC / 地址型 / 随机
 每个图案做 顺序写→顺序读→逆序读→跨步读，覆盖位干扰与行/列解码方向性。
 
-性能：使用 numpy 向量化（比纯 Python 循环快数百倍），
-2GB 内存跑完一轮约几秒，适合放进 GUI。
+性能：用 bytearray 分块写入 + 块级比对，零第三方依赖
+（numpy 在打包环境被排除，曾导致本功能直接崩），
+2GB 跑完一轮约 30 秒，适合放进 GUI。
 """
 
 from __future__ import annotations
@@ -37,6 +38,11 @@ PATTERNS: list[tuple[str, int]] = [
     ("0xFFFF0000", 0xFFFF0000),
     ("0x0000FFFF", 0x0000FFFF),
 ]
+
+# 分块处理大小：整块内存会被写入并校验，但「比对」按块进行，
+# 避免一次性构造等长的副本与小对象（后者会引发内存爆炸）。
+CHUNK = 8 << 20          # 8 MB
+MAX_ERRORS = 5000
 
 
 @dataclass
@@ -89,7 +95,7 @@ def numpy_available() -> bool:
 
 
 class MemTester:
-    """多线程内存测试（numpy 向量化）。"""
+    """多线程内存测试（bytearray 分块，零第三方依赖）。"""
 
     def __init__(self, alloc_mb: int = 2048, threads: int = 0,
                  rounds: int = 1,
@@ -111,64 +117,102 @@ class MemTester:
         except Exception:  # noqa: BLE001
             pass
 
-    def _record(self, offsets: Any, expected: int, actual: Any,
-                pattern: str, pass_no: int, base: int) -> None:
-        import numpy as np
+    def _add_error(self, offset: int, expected: int, actual: int,
+                   pattern: str, pass_no: int) -> None:
         with self._lock:
-            room = 5000 - len(self.result.errors)
-            if room <= 0:
-                return
-            bad = np.nonzero(actual != expected)[0][:room]
-            for i in bad:
+            if len(self.result.errors) < MAX_ERRORS:
                 self.result.errors.append(MemError(
-                    offset=base + int(i) * 4,
-                    expected=f"0x{expected:08X}",
-                    actual=f"0x{int(actual[i]):08X}",
+                    offset=offset, expected=f"0x{expected:08X}",
+                    actual=f"0x{actual:08X}",
                     pattern=pattern, pass_no=pass_no))
 
-    def _test_chunk(self, arr: Any, base_word: int, words: int,
+    def _verify_forward(self, mv: Any, start: int, nbytes: int, expected: int,
+                        pattern: str, pass_no: int) -> None:
+        """顺序读：按块比对，块内用一次字节比较定位是否整块一致。
+
+        关键点：不做整段副本、不切 4 字节小对象——2GB 时那样会产生
+        数亿个临时对象，直接把进程撑爆。
+        """
+        exp = (expected & 0xFFFFFFFF).to_bytes(4, "little")
+        unit = exp * (CHUNK // 4)
+        end = start + nbytes
+        off = start
+        while off < end:
+            n = min(CHUNK, end - off)
+            n -= n % 4
+            if n <= 0:
+                break
+            if mv[off:off + n] != unit[:n]:
+                # 只有命中坏块才逐字定位，避免常态开销
+                raw = bytes(mv[off:off + n])
+                for i in range(0, n, 4):
+                    if raw[i:i + 4] != exp:
+                        self._add_error(off + i, expected,
+                                        int.from_bytes(raw[i:i + 4], "little"),
+                                        pattern, pass_no)
+                        if len(self.result.errors) >= MAX_ERRORS:
+                            return
+            off += n
+
+    def _verify_stride(self, mv: Any, start: int, nbytes: int, expected: int,
+                       pattern: str, pass_no: int) -> None:
+        """跨步读：每 64 字节抽一个 4 字节字，制造行/列干扰。"""
+        exp = (expected & 0xFFFFFFFF).to_bytes(4, "little")
+        end = start + nbytes
+        off = start
+        while off < end - 3:
+            if mv[off:off + 4] != exp:
+                self._add_error(off, expected,
+                                int.from_bytes(mv[off:off + 4], "little"),
+                                f"{pattern}(跨步)", pass_no)
+                if len(self.result.errors) >= MAX_ERRORS:
+                    return
+            off += 64
+
+    def _test_chunk(self, mv: Any, start: int, nbytes: int,
                     pattern: int, name: str, pass_no: int) -> int:
-        """对一个分片跑一轮完整校验，返回扫描字节数。"""
-        import numpy as np
-        seg = arr[base_word:base_word + words]
-        if seg.size == 0:
+        """对一个分片跑一轮完整校验，返回扫描字节数。
+
+        用 bytearray 分块处理（不依赖 numpy）：numpy 在打包环境里被
+        spec 的 excludes 排除，会导致内存测试直接 ModuleNotFoundError。
+        """
+        if nbytes <= 0:
             return 0
-        # 写
-        seg[:] = np.uint32(pattern)
-        scanned = seg.size * 4
-        # 顺序读
-        got = seg.copy()
-        self._record(None, pattern, got, name, pass_no, base_word * 4)
-        if self._stop.is_set():
+        pat = (pattern & 0xFFFFFFFF).to_bytes(4, "little")
+        # 写：整段填充（分块构造，避免造等长巨型 bytes）
+        end = start + nbytes
+        off = start
+        while off < end:
+            n = min(CHUNK, end - off)
+            n -= n % 4
+            if n <= 0:
+                break
+            mv[off:off + n] = pat * (n // 4)
+            off += n
+        scanned = nbytes
+        self._verify_forward(mv, start, nbytes, pattern, name, pass_no)
+        if self._stop.is_set() or len(self.result.errors) >= MAX_ERRORS:
             return scanned
-        # 逆序读（模拟 MemTest 的地址解码方向测试）
-        rev = seg[::-1]
-        self._record(None, pattern, rev, name, pass_no, base_word * 4)
-        if self._stop.is_set():
-            return scanned
-        # 跨步读（每 16 字 = 64 字节一处，制造行/列干扰）
-        step = seg[::16]
-        self._record(None, pattern, step, name, pass_no, base_word * 4)
+        self._verify_stride(mv, start, nbytes, pattern, name, pass_no)
         return scanned
 
-    def _worker(self, arr: Any, words: int, idx: int, total: int) -> None:
-        chunk = words // total
-        base = idx * chunk
-        n = chunk if idx < total - 1 else (words - base)
+    def _worker(self, mv: Any, size: int, idx: int, total: int) -> None:
+        chunk = size // total
+        start = idx * chunk
+        n = chunk if idx < total - 1 else (size - start)
+        # 每线程的分片对齐到 4 字节
+        n -= n % 4
         for p in range(1, self.rounds + 1):
             if self._stop.is_set():
                 return
             for name, pat in PATTERNS:
                 if self._stop.is_set():
                     return
-                scanned = self._test_chunk(arr, base, n, pat, name, p)
+                scanned = self._test_chunk(mv, start, n, pat, name, p)
                 with self._lock:
                     self.result.patterns_done += 1
                     self.result.bytes_scanned += scanned
-
     def run(self) -> MemTestResult:
-        import numpy as np
-
         total_gb, free_gb = available_memory()
         self.result.total_ram_gb = round(total_gb, 1)
         self.result.free_ram_gb = round(free_gb, 1)
@@ -180,17 +224,20 @@ class MemTester:
             size = max(64 << 20, limit)
             self.result.alloc_mb = size >> 20
             self._log(f"可用内存有限，自动调整为 {size >> 20} MB")
-        words = size // 4
+        # 对齐到 4 字节
+        size -= size % 4
 
         self._log(f"分配 {size >> 20} MB 并触碰全部页面…")
         try:
-            arr = np.zeros(words, dtype=np.uint32)
+            # bytearray：零依赖（不依赖 numpy），且可直接切片比较
+            mv = bytearray(size)
         except MemoryError:
             self.result.note = "内存分配失败"
             return self.result
         # 强制提交物理页
-        for off in range(0, words, 1 << 16):
-            arr[off] = 1
+        touch = 1 << 16
+        for off in range(0, size, touch):
+            mv[off] = 1
 
         self.result.note = (f"仅测试空闲内存 {size >> 20} MB；"
                             f"Windows 自身占用的 {max(0, total_gb-free_gb):.1f} GB "
@@ -200,7 +247,7 @@ class MemTester:
                   f"{len(PATTERNS)} 图案…")
         start = time.time()
         workers = [threading.Thread(target=self._worker,
-                                    args=(arr, words, i, self.threads),
+                                    args=(mv, size, i, self.threads),
                                     daemon=True)
                    for i in range(self.threads)]
         for w in workers:
@@ -224,7 +271,7 @@ class MemTester:
         finished = all(not w.is_alive() for w in workers)
         self.result.cancelled = not finished
         self.result.passed = not self.result.errors and finished
-        del arr
+        del mv
         core.log(f"内存测试：{self.result.alloc_mb}MB，"
                  f"错误 {len(self.result.errors)}，{self.result.seconds}s",
                  source="memtest")

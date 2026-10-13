@@ -48,7 +48,7 @@ hiddenimports = [
     "junkcleaner.localgpo",
     "junkcleaner.memtest", "junkcleaner.ui_hardware",
     "junkcleaner.afterburner", "junkcleaner.silent_uninstall",
-    "numpy",
+    "junkcleaner.vramtest",
 ]
 
 # 不手工收集 Qt 全部库（会让体积涨到 190MB+，且曾破坏归档完整性）。

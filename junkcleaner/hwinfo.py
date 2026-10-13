@@ -22,6 +22,67 @@ from typing import Any
 from . import core
 
 
+def current_freq_mhz() -> int:
+    """读取 CPU 当前实际运行频率（MHz）。
+
+    为什么不直接用注册表 ~MHz 或 Win32_Processor.CurrentClockSpeed：
+    那两项在多数机器上返回的是**基准频率**（本例 3418 / 3401 MHz），
+    与实时运行频率无关，所以界面上看到的永远是基础频率。
+
+    这里用 Windows 性能计数器 `% Processor Performance`（相对基准频率的
+    百分比）换算：实测本机空闲时约 5.2 GHz、基准 3.4 GHz。
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+            base, _ = winreg.QueryValueEx(k, "~MHz")
+            base = int(base)
+    except OSError:
+        return 0
+    if base <= 0:
+        return 0
+    # 优先用性能计数器（能反映睿频）
+    try:
+        proc = core.run_powershell(
+            "[int]((Get-Counter "
+            "'\\Processor Information(_Total)\\% Processor Performance' "
+            "-ErrorAction SilentlyContinue).CounterSamples.CookedValue)",
+            timeout=20)
+        text = (proc.stdout or b"").decode("utf-8", "replace").strip()
+        pct = int(float(text))
+        if pct > 0:
+            mhz = int(base * pct / 100.0)
+            if 100 <= mhz <= 10000:
+                return mhz
+    except Exception:  # noqa: BLE001
+        pass
+    # 退回 CallNtPowerInformation（部分机器能反映实时值）
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PPI(ctypes.Structure):
+            _fields_ = [("Number", wintypes.ULONG), ("MaxMhz", wintypes.ULONG),
+                        ("CurrentMhz", wintypes.ULONG),
+                        ("MhzLimit", wintypes.ULONG),
+                        ("MaxIdleState", wintypes.ULONG),
+                        ("CurrentIdleState", wintypes.ULONG)]
+
+        n = max(1, ctypes.windll.kernel32.GetActiveProcessorCount(0))
+        buf = (_PPI * n)()
+        st = ctypes.windll.powrprof.CallNtPowerInformation(
+            11, None, 0, ctypes.byref(buf), ctypes.sizeof(buf))
+        if st == 0:
+            mhz = int(sum(r.CurrentMhz for r in buf) / n)
+            if mhz > 0:
+                return mhz
+    except Exception:  # noqa: BLE001
+        pass
+    return base
+
+
 # --------------------------------------------------------------------------
 # CPU
 # --------------------------------------------------------------------------
@@ -34,6 +95,7 @@ class CpuInfo:
     threads: int = 0
     base_mhz: int = 0
     max_mhz: int = 0
+    current_mhz: int = 0
     l2_kb: int = 0
     l3_kb: int = 0
     architecture: str = ""
@@ -127,6 +189,7 @@ def collect_cpu() -> CpuInfo:
             except ValueError:
                 pass
             break
+    info.current_mhz = current_freq_mhz()
     info.features = _detect_features()
     return info
 

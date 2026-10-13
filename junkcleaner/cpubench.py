@@ -11,11 +11,13 @@
 from __future__ import annotations
 
 import math
-import multiprocessing as mp
 import os
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Callable
 
 from . import core
@@ -51,6 +53,46 @@ def _worker(args: tuple[int, int]) -> float:
     return _workload(seed, iters)
 
 
+def worker_cli(argv: list[str]) -> int:
+    """多核跑分的子进程入口：跑一次负载并把耗时打印到 stdout。
+
+    为什么不用 multiprocessing.Pool：打包成单文件 EXE 后，
+    Pool 需要重新引导本程序，在冻结环境下容易出现句柄/权限问题
+    （实测 WinError 5），表现为「跑分没反应」。改为自己用
+    subprocess 拉起同一可执行文件 + 隐藏参数，行为完全可控。
+    """
+    try:
+        seed = int(argv[0])
+        iters = int(argv[1])
+    except (IndexError, ValueError):
+        print("0.0")
+        return 2
+    print(f"{_workload(seed, iters):.6f}")
+    return 0
+
+
+def _spawn_args(seed: int, iters: int) -> list[str]:
+    """构造子进程命令行（兼容源码运行与打包运行）。"""
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--cpu-bench-worker", str(seed), str(iters)]
+    entry = Path(__file__).resolve().parents[1] / "junkcleaner_entry.py"
+    exe = core.python_exe_windowless()
+    return [exe, str(entry), "--cpu-bench-worker", str(seed), str(iters)]
+
+
+def _run_chunk(seed: int, iters: int) -> float:
+    """在独立子进程里跑一段负载，返回耗时秒数。"""
+    flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+    try:
+        p = subprocess.run(_spawn_args(seed, iters), capture_output=True,
+                           timeout=600, creationflags=flags)
+        out = (p.stdout or b"").decode("utf-8", "replace").strip()
+        line = out.splitlines()[-1] if out else "0"
+        return float(line)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 @dataclass
 class BenchResult:
     single_score: float = 0.0
@@ -65,7 +107,7 @@ class BenchResult:
         return asdict(self)
 
 
-def benchmark(iterations: int = 220_000,
+def benchmark(iterations: int = 6_000_000,
               progress: Callable[[str], None] | None = None) -> BenchResult:
     """跑单核 + 多核基准。分数 = 每秒千次迭代（越高越快）。"""
     res = BenchResult()
@@ -88,11 +130,36 @@ def benchmark(iterations: int = 220_000,
     # 多核：用进程池（避免 GIL）
     say(f"多核测试（{threads} 线程）…")
     t0 = time.perf_counter()
+    # 同时拉起 N 个独立子进程（绕开 GIL，也绕开冻结环境下的
+    # multiprocessing.Pool 兼容问题）。
+    procs: list[subprocess.Popen] = []
+    flags = 0x08000000 if os.name == "nt" else 0
     try:
-        with mp.Pool(processes=threads) as pool:
-            pool.map(_worker, [(i + 1, iterations) for i in range(threads)])
-    except Exception as exc:  # noqa: BLE001
-        res.note = f"多核测试降级为线程池：{exc}"
+        for i in range(threads):
+            procs.append(subprocess.Popen(
+                _spawn_args(i + 1, iterations),
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=flags))
+        for p in procs:
+            try:
+                p.communicate(timeout=600)
+            except Exception:  # noqa: BLE001
+                p.kill()
+        ok_children = sum(1 for p in procs if p.returncode == 0)
+        if ok_children == 0:
+            res.note = "子进程全部失败，已降级为线程池"
+            raise RuntimeError("no child succeeded")
+        if ok_children < threads:
+            res.note = f"{threads - ok_children} 个子进程未正常返回，结果偏保守"
+    except Exception:  # noqa: BLE001
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        if not res.note:
+            res.note = "多核测试降级为线程池"
         ts = []
         for i in range(threads):
             t = threading.Thread(target=_workload, args=(i + 1, iterations))

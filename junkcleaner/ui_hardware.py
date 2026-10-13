@@ -60,6 +60,11 @@ class HardwarePage(QWidget):
         # 延迟到事件循环启动后再检测，避免阻塞主窗口构建
         from PySide6.QtCore import QTimer
         QTimer.singleShot(400, self.refresh_info)
+        # CPU 当前频率会随睿频/负载变化，单独定时刷新（1.5 秒一次）
+        self._freq_timer = QTimer(self)
+        self._freq_timer.setInterval(1500)
+        self._freq_timer.timeout.connect(self._refresh_cpu_freq)
+        self._freq_timer.start()
         # 调试用：允许直接定位到某个子页
         import os
         sub = os.environ.get("JUNKCLEANER_SUBTAB")
@@ -106,7 +111,7 @@ class HardwarePage(QWidget):
         g = QGridLayout(info_box)
         self.cpu_fields: dict[str, QLabel] = {}
         rows = [("name", "型号"), ("vendor", "厂商"), ("cores", "核心 / 线程"),
-                ("cache", "二级 / 三级缓存"), ("freq", "基准 / 最大频率"),
+                ("cache", "二级 / 三级缓存"), ("freq", "频率（当前 / 基准 / 最大）"),
                 ("feat", "指令集"), ("micro", "微码")]
         for i, (key, label) in enumerate(rows):
             name = QLabel(label)
@@ -333,6 +338,23 @@ class HardwarePage(QWidget):
         return page
 
     # ---------------- 数据 ----------------
+    def _refresh_cpu_freq(self) -> None:
+        """定时刷新 CPU 当前频率（睿频会变，基准频率不会）。"""
+        try:
+            cpu = (self._info or {}).get("cpu") or {}
+            base = cpu.get("base_mhz") or 0
+            mx = cpu.get("max_mhz") or 0
+            if not base:
+                return
+            cur = hwinfo.current_freq_mhz()
+            if not cur:
+                return
+            cpu["current_mhz"] = cur
+            self.cpu_fields["freq"].setText(
+                f"当前 <b>{cur} MHz</b>　基准 {base} MHz　最大 {mx} MHz")
+        except Exception:  # noqa: BLE001
+            pass
+
     def refresh_info(self) -> None:
         import json
         self.lbl_sys.setText("正在检测硬件…")
@@ -356,7 +378,13 @@ class HardwarePage(QWidget):
                            f"　{cpu.get('architecture','')}")
         f["cache"].setText(f"L2 {cpu.get('l2_kb',0)//1024} MB ／ "
                            f"L3 {cpu.get('l3_kb',0)//1024} MB")
-        f["freq"].setText(f"{cpu.get('base_mhz')} MHz / {cpu.get('max_mhz')} MHz")
+        base = cpu.get("base_mhz") or 0
+        mx = cpu.get("max_mhz") or 0
+        cur = cpu.get("current_mhz") or 0
+        cur_txt = f"<b>{cur} MHz</b>" if cur else "—"
+        f["freq"].setText(
+            f"当前 {cur_txt}　基准 {base} MHz　最大 {mx} MHz")
+        self._cpu_clock_base = cur or base
         f["feat"].setText("、".join(cpu.get("features") or []) or "—")
         f["micro"].setText(cpu.get("microcode") or "—")
 
