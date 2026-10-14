@@ -79,9 +79,13 @@ class NvAdaptiveUndervolt:
         loader.start()
         time.sleep(2.0)
         if not loader.running:
-            note = (loader.errors or ["CUDA 负载未能启动"])[0]
+            note = loader.startup_error or (loader.errors or
+                                            ["GPU 负载未能启动"])[0]
             loader.stop()
-            return {"ok": False, "reason": f"负载启动失败：{note}",
+            # 关键区分：负载没跑起来属于「环境/后端问题」，
+            # 不能当成「该电压不稳定」，否则会得到完全错误的结论。
+            return {"ok": False, "load_error": True,
+                    "reason": f"压测负载无法启动：{note}",
                     "attempt": mv}
 
         clocks: list[int] = []
@@ -150,6 +154,17 @@ class NvAdaptiveUndervolt:
             res.error = "未找到 NVAPI 调参工具（simple-nvidia-undervolt）"
             return res
 
+        # 预检：压测后端不可用时提前失败，避免动过一次电压之后才发现
+        # 「负载起不来」，那样既浪费时间又容易让人误以为是电压问题。
+        backend = gpu_load.stress_backend()
+        if not backend.get("ok"):
+            res.error = (f"{backend.get('error')}。\n\n"
+                         "提示：本版本把 OpenCL 压测器内嵌在程序中，"
+                         "只要 NVIDIA 驱动正常即可使用；"
+                         "若文件被杀软删除，请恢复后重试。")
+            return res
+        self._log(f"压测后端：{backend.get('mode')}")
+
         st = nvbackend.status()
         if not st.get("ok"):
             res.error = f"无法读取显卡状态：{st.get('error')}"
@@ -186,8 +201,15 @@ class NvAdaptiveUndervolt:
         r = self._verify(landed)
         res.attempts.append(r)
         if not r.get("ok"):
-            res.error = (f"起始电压 {landed:.0f}mV 就不稳定"
-                         f"（{r.get('reason')}），请从更高电压开始")
+            if r.get("load_error"):
+                # 不能把「压测没跑起来」说成「电压不稳」，否则会误导排查。
+                res.error = (f"{r.get('reason')}。\n\n"
+                             "这是压测环境问题，不是起始电压的问题；"
+                             "请确认已安装 NVIDIA 驱动后重试。"
+                             "如仍失败，请在「运行日志」页查看详情。")
+            else:
+                res.error = (f"起始电压 {landed:.0f}mV 就不稳定"
+                             f"（{r.get('reason')}），请从更高电压开始")
             return res
         stable_mv = landed
         best_backup = landed
@@ -223,6 +245,12 @@ class NvAdaptiveUndervolt:
                 self._log(f"  ✓ {actual:.0f}mV 稳定")
                 mv = actual - self.step
             else:
+                if r.get("load_error"):
+                    res.error = (f"{r.get('reason')}。\n\n"
+                                 "这是压测环境问题，不是电压结论；已回退到"
+                                 f"上一稳定档 {best_backup:.0f}mV。")
+                    self._apply(best_backup)
+                    break
                 self._log(f"  ✗ {mv:.0f}mV 不稳定（{r.get('reason')}），回退")
                 self._apply(best_backup)
                 break

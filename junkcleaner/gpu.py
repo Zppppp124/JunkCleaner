@@ -203,12 +203,14 @@ def stability_test(target_clock: int, seconds: int = 60,
                 loader.start()
                 if not loader.running:
                     stress_summary["note"] = (
-                        (loader.errors or ["CUDA 负载未能启动"])[0])
+                        loader.startup_error or
+                        (loader.errors or ["GPU 负载未能启动"])[0])
                     loader = None
                 else:
                     time.sleep(3.0)      # 等负载起来
             else:
-                stress_summary["note"] = backend.get("error") or "CUDA 不可用"
+                stress_summary["note"] = (backend.get("error") or
+                                          "GPU 压测后端不可用")
         except Exception as exc:  # noqa: BLE001
             stress_summary["note"] = f"负载启动失败：{exc}"
 
@@ -234,7 +236,10 @@ def stability_test(target_clock: int, seconds: int = 60,
             if loader and loader.errors:
                 break
             # 静默数据损坏（算错但不报错）必须单独检查，否则会误判为稳定。
-            ext_now = getattr(loader, "_external", None) if loader else None
+            ext_now = None
+            if loader is not None:
+                ext_now = (getattr(loader, "_opencl", None) or
+                           getattr(loader, "_external", None))
             if ext_now is not None:
                 try:
                     corruption = ext_now.corruption()
@@ -242,12 +247,12 @@ def stability_test(target_clock: int, seconds: int = 60,
                     corruption = ""
                 if corruption:
                     break
-            # 打包版使用外部 CUDA 进程做负载；若它异常退出（驱动重置），
-            # 这里必须判为不稳定，否则会误报稳定。
+            # 压测进程异常退出：若非零退出码，通常代表电压不足导致
+            # 驱动重置，必须判为不稳定，否则会误报稳定。
             ext = ext_now
             if ext is not None and not ext.alive and ext.returncode not in (None, 0):
                 loader.errors.append(
-                    f"CUDA 负载进程异常退出（rc={ext.returncode}），"
+                    f"GPU 压测进程异常退出（rc={ext.returncode}），"
                     "通常代表电压不足导致驱动重置")
                 break
             time.sleep(2.0)

@@ -1404,6 +1404,10 @@ def run_gui(argv: list[str] | None = None) -> int:
     app.setWindowIcon(icon)
     win = MainWindow()
     win.setWindowIcon(icon)
+    # 无论退出路径如何（关窗、托盘退出、任务管理器结束），
+    # 都要等所有后台 QThread 收尾。线程仍在跑时 Qt 析构对象会
+    # 让进程以 0xc0000409 退出，这是 Windows 上最容易被忽略的崩溃源。
+    app.aboutToQuit.connect(lambda: _stop_all_workers(win))
     import os
     try:
         tab = int(os.environ.get("JUNKCLEANER_TAB", "0"))
@@ -1419,6 +1423,37 @@ def run_gui(argv: list[str] | None = None) -> int:
     else:
         win.show()
     return app.exec()
+
+
+def _stop_all_workers(win: "MainWindow") -> None:
+    """退出前收尾所有后台线程。
+
+    QThread 仍在运行时 Qt 会析构相关对象，导致进程以 0xc0000409
+    退出。closeEvent 只覆盖「关窗」这一条路径；托盘退出、系统注销、
+    任务管理器结束进程都可能绕过它，因此在 aboutToQuit 里再兜底一次。
+    """
+    for page_attr in ("trust_page", "memory_page", "tuning_page",
+                      "hardware_page", "defender_page"):
+        page = getattr(win, page_attr, None)
+        shutdown = getattr(page, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+    # 启动阶段的短任务：守护自检 / Defender 策略应用
+    for attr in ("_guard_check", "_defender_worker"):
+        w = getattr(win, attr, None)
+        if w is None:
+            continue
+        try:
+            if w.isRunning():
+                w.quit()
+                if not w.wait(8000):
+                    w.terminate()
+                    w.wait(1000)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _set_app_user_model_id() -> None:

@@ -57,7 +57,14 @@ def main() -> int:
     app.processEvents()
     assert win.trust_page.tabs.count() == 3, "可信软件子页异常"
     print("trust page OK")
-    win.close()
+    # 必须真正跑一段事件循环再退出：后台 QThread 需要在事件循环里
+    # 完成收尾，否则解释器退出时进程会随机以 0xc0000409 结束。
+    # 真实用户路径由 run_gui 的 aboutToQuit -> _stop_all_workers 兜底。
+    from PySide6.QtCore import QTimer
+    QTimer.singleShot(300, win.close)
+    QTimer.singleShot(600, app.quit)
+    app.exec()
+    gui._stop_all_workers(win)
     app.processEvents()
     print("RESULT: PASS")
     return 0

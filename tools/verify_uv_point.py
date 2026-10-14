@@ -49,7 +49,8 @@ def main() -> int:
             continue
     s.stop()
 
-    corrupt = s._external.corruption() if s._external else ""
+    runner = getattr(s, "_opencl", None) or getattr(s, "_external", None)
+    corrupt = runner.corruption() if runner is not None else ""
     errs = s.summary()["errors"]
     # 只统计「真正处于满载」的样本：瞬态模式会在轻载与满载间跳变，
     # 低载样本的时钟天然很低，把它们算进去会误报「掉频」。

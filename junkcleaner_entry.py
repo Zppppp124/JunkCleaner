@@ -112,6 +112,20 @@ def main() -> int:
         from junkcleaner import gpu
         _boot_log("applying saved GPU profile ...")
         return 0 if gpu.apply_saved_profile().get("ok") else 1
+    if "--gpu-stress-check" in argv:
+        # 诊断用：只跑压测，不读写任何显卡电压/频率设置。
+        from junkcleaner import gpu_load
+        import time as _time
+        print("backend:", gpu_load.stress_backend())
+        print("exe    :", gpu_load.stress_exe_path())
+        s = gpu_load.GpuStress(transient=True)
+        s.start()
+        _time.sleep(6)
+        print("running:", s.running, "backend:", s.backend)
+        print("errors :", s.errors)
+        print("summary:", s.summary())
+        s.stop()
+        return 0 if (s.backend != "none" and not s.errors) else 1
     if "--cpu-bench-worker" in argv:
         # CPU 多核跑分的子进程：只跑负载并输出耗时，不启动 GUI
         from junkcleaner import cpubench

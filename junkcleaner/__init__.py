@@ -1,6 +1,6 @@
 """JunkCleaner - Windows 垃圾/流氓软件扫描、彻底卸载与安装拦截."""
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 APP_NAME = "JunkCleaner 净扫"
 APP_NAME_EN = "JunkCleaner"
 

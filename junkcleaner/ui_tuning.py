@@ -359,9 +359,24 @@ class TuningPage(QWidget):
         # 旧实现依赖 MSI Afterburner 的 Profile 文件；现改为直接调用
         # NVAPI（经 simple-nvidia-undervolt），可读真实电压且无需专有软件。
         nv_ok = nvbackend.available()
+        # 显示实际可用的压测后端：内嵌 OpenCL 压测器不依赖 Python/PyTorch，
+        # 换电脑时也能跑；这里先展示出来，避免远程排查时靠猜。
+        try:
+            from . import gpu_load as _gl
+            _be = _gl.stress_backend()
+        except Exception:  # noqa: BLE001
+            _be = {"ok": False}
+        if _be.get("ok"):
+            stress_txt = (
+                f"<span style='color:{GOOD}'>压测后端：内置 OpenCL"
+                f"</span>")
+        else:
+            stress_txt = (
+                f"<span style='color:{DANGER}'>压测后端不可用</span>")
         self.lbl_ab = QLabel(
             f"<span style='color:{GOOD}'>NVAPI 直连可用</span>"
             f"　<span style='color:{MUTED}'>无需 MSI Afterburner</span>"
+            f"　{stress_txt}"
             if nv_ok else
             f"<span style='color:{WARN}'>未找到 NVAPI 调参组件，"
             "降压功能不可用</span>")

@@ -37,6 +37,16 @@ for _f in (_nv_exe, _nv_lic):
         print(f"[spec] 内嵌 {_f}")
     else:
         print(f"[spec] 警告：缺少 {_f}")
+
+# 内置 OpenCL 压测器（本项目自研，源码见 tools/_ocl_stress_build）。
+# 它只依赖 NVIDIA 驱动自带的 OpenCL 运行时，使降压搜索在任意电脑上
+# 都不需要 Python/PyTorch。
+_stress_exe = "junkcleaner/assets/gpu_stress.exe"
+if os.path.exists(_stress_exe):
+    _datas.append((_stress_exe, "junkcleaner/assets"))
+    print(f"[spec] 内嵌 {_stress_exe}")
+else:
+    print(f"[spec] 警告：缺少 {_stress_exe}")
 if os.environ.get("JUNKCLEANER_BUNDLE_AB") == "1":
     _ab_zip = "junkcleaner/assets/MSIAfterburnerSetup.zip"
     if os.path.exists(_ab_zip):
